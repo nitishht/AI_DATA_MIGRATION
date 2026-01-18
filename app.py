@@ -1,5 +1,5 @@
 import oracledb
-
+#oracledb
 oracledb.init_oracle_client(
     lib_dir=r"C:\Users\QG165WL\Downloads\instantclient-basic-windows.x64-23.26.0.0.0\instantclient_23_0"
 )
