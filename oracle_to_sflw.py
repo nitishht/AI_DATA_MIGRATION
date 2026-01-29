@@ -15,11 +15,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 load_dotenv()
 
-# ----------------------------
-# CONFIG
-# ----------------------------
 
-# Oracle (same as your current script)
 ORACLE_CLIENT_PATH = r"C:\Users\AD739BB\Downloads\instantclient-basic-windows.x64-23.26.0.0.0\instantclient_23_0"
 
 SRC_DB = {
@@ -28,7 +24,6 @@ SRC_DB = {
     "dsn": "127.0.0.1:1521/XE"
 }
 
-# Snowflake target
 SNOWFLAKE = {
     "account": os.getenv("SNOWFLAKE_ACCOUNT", ""),
     "user": os.getenv("SNOWFLAKE_USER", ""),
@@ -38,30 +33,17 @@ SNOWFLAKE = {
     "schema": os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC"),
 }
 
-# LLM
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-# Put your incubator key in env var (do not hardcode)
-# export OPENAI_API_KEY="..."
-# OpenAI SDK reads OPENAI_API_KEY by default.  [1](https://pypi.org/project/openai/)
 
 BATCH_SIZE = 5000
 
-# If true: create/replace tables each run (drops prior data)
 CREATE_OR_REPLACE = True
 
-# Optional: only migrate a subset of tables
 TABLE_FILTER: Optional[List[str]] = None
 
 
-# ----------------------------
-# INIT ORACLE CLIENT (THICK)
-# ----------------------------
 oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_PATH)
 
-
-# ----------------------------
-# HELPERS
-# ----------------------------
 
 IDENT_OK = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
@@ -74,7 +56,6 @@ def sf_ident(name: str) -> str:
     name_u = name.upper()
     if IDENT_OK.match(name_u):
         return name_u
-    # escape quotes if needed
     return f'"{name.replace(chr(34), chr(34)*2)}"'
 
 def oracle_columns_metadata(src_cur, table: str) -> List[Tuple]:
@@ -110,7 +91,6 @@ def fallback_oracle_to_snowflake_type(dtype: str, length, precision, scale) -> s
     dtype = (dtype or "").upper()
 
     if dtype in ("VARCHAR2", "NVARCHAR2", "VARCHAR", "CHAR", "NCHAR"):
-        # Snowflake VARCHAR/CHAR; keep length if available
         if length:
             return f"VARCHAR({int(length)})"
         return "VARCHAR"
@@ -125,11 +105,9 @@ def fallback_oracle_to_snowflake_type(dtype: str, length, precision, scale) -> s
         return "FLOAT"
 
     if dtype == "DATE":
-        # Oracle DATE includes time; Snowflake equivalent often TIMESTAMP_NTZ
         return "TIMESTAMP_NTZ"
 
     if dtype.startswith("TIMESTAMP"):
-        # Map Oracle TIMESTAMP variants to Snowflake equivalents
         if "WITH TIME ZONE" in dtype:
             return "TIMESTAMP_TZ"
         if "WITH LOCAL TIME ZONE" in dtype:
@@ -142,7 +120,6 @@ def fallback_oracle_to_snowflake_type(dtype: str, length, precision, scale) -> s
     if dtype in ("BLOB", "RAW", "LONG RAW"):
         return "BINARY"
 
-    # For JSON/XMLTYPE etc., default to VARIANT (common in Snowflake)
     if dtype in ("JSON", "XMLTYPE", "SYS.ANYDATA"):
         return "VARIANT"
 
@@ -154,7 +131,6 @@ def build_llm_prompt(table: str, columns: List[Tuple]) -> str:
     Provide Oracle metadata and guardrails to the model.
     We explicitly ask for JSON only.
     """
-    # A small mapping guide consistent with Snowflake’s published equivalents. [3](https://docs.snowflake.com/en/migrations/snowconvert-docs/translation-references/oracle/basic-elements-of-oracle-sql/data-types/README)
     mapping_guide = """
 Oracle→Snowflake type guidance (use these unless strong reason):
 - VARCHAR2/NVARCHAR2/VARCHAR/CHAR/NCHAR -> VARCHAR(n)
@@ -205,7 +181,6 @@ def llm_generate_snowflake_ddl(client: OpenAI, table: str, columns: List[Tuple])
     """
     prompt = build_llm_prompt(table, columns)
 
-    # Use Responses API (primary interface in OpenAI SDK). [1](https://pypi.org/project/openai/)
     resp = client.responses.create(
         model=OPENAI_MODEL,
         input=prompt,
@@ -247,7 +222,6 @@ def load_table_to_snowflake(src_cur, sf_conn, table: str, column_list: List[str]
     Batch fetch from Oracle -> pandas -> Snowflake write_pandas.
     Snowflake supports writing DataFrames using the connector. [2](https://docs.snowflake.com/en/developer-guide/python-connector/python-connector-pandas)
     """
-    # Pull data from Oracle
     src_cur.execute(f'SELECT * FROM "{table}"')
 
     total = 0
@@ -258,15 +232,13 @@ def load_table_to_snowflake(src_cur, sf_conn, table: str, column_list: List[str]
 
         df = pd.DataFrame(rows, columns=column_list)
 
-        # Bulk upload via write_pandas (fast).
-        # Note: the destination table must exist; write_pandas appends by default. [2](https://docs.snowflake.com/en/developer-guide/python-connector/python-connector-pandas)
         success, nchunks, nrows, _ = write_pandas(
             conn=sf_conn,
             df=df,
             table_name=table,
             database=SNOWFLAKE["database"],
             schema=SNOWFLAKE["schema"],
-            quote_identifiers=False  # we use uppercase + safe identifiers
+            quote_identifiers=False
         )
 
         if not success:
@@ -277,19 +249,12 @@ def load_table_to_snowflake(src_cur, sf_conn, table: str, column_list: List[str]
     return total
 
 
-# ----------------------------
-# MAIN
-# ----------------------------
-
 def main():
-    # LLM client
     llm = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    # Oracle connections
     src_conn = oracledb.connect(**SRC_DB)
     src_cur = src_conn.cursor()
     src_cur.arraysize = BATCH_SIZE
 
-    # Snowflake connection
     sf_conn = snowflake.connector.connect(
         account=SNOWFLAKE["account"],
         user=SNOWFLAKE["user"],
@@ -302,13 +267,11 @@ def main():
 
     print("✅ Connected to Oracle (source) and Snowflake (target)")
 
-    # Ensure context (good practice)
     sf_exec(sf_cur, f'USE WAREHOUSE {sf_ident(SNOWFLAKE["warehouse"])};')
     sf_exec(sf_cur, f'USE DATABASE {sf_ident(SNOWFLAKE["database"])};')
     sf_exec(sf_cur, f'CREATE SCHEMA IF NOT EXISTS {sf_ident(SNOWFLAKE["schema"])};')
     sf_exec(sf_cur, f'USE SCHEMA {sf_ident(SNOWFLAKE["schema"])};')
 
-    # Get tables from Oracle
     tables = oracle_tables(src_cur)
     print(f"📦 Found {len(tables)} tables in Oracle source")
 
@@ -317,7 +280,6 @@ def main():
 
         cols = oracle_columns_metadata(src_cur, table)
 
-        # --- Step 2A: LLM generate Snowflake DDL (auto)
         try:
             ddl, column_list = llm_generate_snowflake_ddl(llm, table, cols)
             print("🤖 LLM generated DDL")
@@ -325,16 +287,13 @@ def main():
             print(f"⚠️ LLM failed for {table}, using deterministic fallback. Reason: {e}")
             ddl, column_list = deterministic_ddl(table, cols)
 
-        # --- Execute DDL in Snowflake (auto)
         try:
             sf_exec(sf_cur, ddl)
             print("🧱 Created/Updated table in Snowflake")
         except Exception as e:
             print(f"❌ Snowflake DDL execution failed for {table}\nDDL:\n{ddl}\nError: {e}")
-            # Optionally stop here
             raise
 
-        # --- Step 2B: Load data (auto)
         start = time.time()
         try:
             loaded = load_table_to_snowflake(src_cur, sf_conn, table, column_list)
@@ -344,7 +303,6 @@ def main():
             print(f"❌ Data load failed for {table}: {e}")
             raise
 
-        # --- Optional: lightweight validation (row count)
         try:
             src_cur.execute(f'SELECT COUNT(*) FROM "{table}"')
             src_count = int(src_cur.fetchone()[0])
@@ -357,7 +315,6 @@ def main():
         except Exception as e:
             print(f"⚠️ Validation skipped/failed for {table}: {e}")
 
-    # Cleanup
     src_cur.close()
     src_conn.close()
     sf_cur.close()
