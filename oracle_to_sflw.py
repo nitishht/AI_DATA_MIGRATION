@@ -52,7 +52,7 @@ AZURE_OPENAI_DEPLOYMENT = (os.getenv("AZURE_OPENAI_DEPLOYMENT") or "").strip()
 
 
 
-BATCH_SIZE = 5000
+BATCH_SIZE = 100000
 
 CREATE_OR_REPLACE = True
 
@@ -152,6 +152,50 @@ def oracle_columns_metadata(src_cur, table: str) -> List[Tuple]:
     """, tbl=table)
     return src_cur.fetchall()
 
+
+def oracle_table_constraints(src_cur, table: str) -> List[dict]:
+    """
+    Returns a list of constraints for the given table.
+    Each dict contains: type, name, columns, (for FKs: r_table, r_columns)
+    """
+    
+    src_cur.execute("""
+        SELECT c.constraint_type, c.constraint_name, cc.column_name, c.search_condition
+        FROM user_constraints c
+        JOIN user_cons_columns cc ON c.constraint_name = cc.constraint_name
+        WHERE c.table_name = :tbl
+        AND c.constraint_type IN ('P', 'U', 'C')
+        ORDER BY c.constraint_type, c.constraint_name, cc.position
+    """, tbl=table)
+    constraints = []
+    for row in src_cur.fetchall():
+        constraints.append({
+            "type": row[0],
+            "name": row[1],
+            "column": row[2],
+            "condition": row[3]
+        })
+    
+    src_cur.execute("""
+        SELECT c.constraint_name, cc.column_name, c.r_constraint_name, r.table_name, rcc.column_name
+        FROM user_constraints c
+        JOIN user_cons_columns cc ON c.constraint_name = cc.constraint_name
+        JOIN user_constraints r ON c.r_constraint_name = r.constraint_name
+        JOIN user_cons_columns rcc ON r.constraint_name = rcc.constraint_name AND cc.position = rcc.position
+        WHERE c.table_name = :tbl
+        AND c.constraint_type = 'R'
+        ORDER BY c.constraint_name, cc.position
+    """, tbl=table)
+    for row in src_cur.fetchall():
+        constraints.append({
+            "type": "R",
+            "name": row[0],
+            "column": row[1],
+            "r_table": row[3],
+            "r_column": row[4]
+        })
+    return constraints
+
 def oracle_tables(src_cur) -> List[str]:
     src_cur.execute("SELECT table_name FROM user_tables ORDER BY table_name")
     tables = [r[0] for r in src_cur.fetchall()]
@@ -202,7 +246,7 @@ def fallback_oracle_to_snowflake_type(dtype: str, length, precision, scale) -> s
     return "VARCHAR"
 
 
-def build_llm_prompt(table: str, columns: List[Tuple]) -> str:
+def build_llm_prompt(table: str, columns: List[Tuple], constraints:List[dict]) -> str:
     """
     Provide Oracle metadata and guardrails to the model.
     We explicitly ask for JSON only.
@@ -237,13 +281,16 @@ Oracle→Snowflake type guidance (use these unless strong reason):
         "target_schema": SNOWFLAKE["schema"],
         "create_or_replace": CREATE_OR_REPLACE,
         "oracle_columns": cols,
+        "oracle_constraints": constraints,
         "mapping_guide": mapping_guide.strip(),
         "requirements": [
             "Return STRICT JSON only; no markdown, no explanations.",
             "JSON must contain keys: create_table_sql, column_list.",
             "create_table_sql must be valid Snowflake SQL.",
             "Use NOT NULL when nullable='N', else allow NULL.",
-            "Prefer unquoted uppercase identifiers when possible; otherwise quote safely."
+            "Prefer unquoted uppercase identifiers when possible; otherwise quote safely.",
+            "Include primary key, unique, foreign key, and check constraints in the DDL if present.",
+            "Do NOT include CHECK constraints; Snowflake does not support them."
         ]
     }
 
@@ -271,13 +318,13 @@ Oracle→Snowflake type guidance (use these unless strong reason):
 #     data = json.loads(text)
 #     return data["create_table_sql"], data["column_list"]
 
-def llm_generate_snowflake_ddl(client: OpenAI, model_name: str, table: str, columns: List[Tuple]) -> Tuple[str, List[str]]:
+def llm_generate_snowflake_ddl(client: OpenAI, model_name: str, table: str, columns: List[Tuple], constraints: List[dict]) -> Tuple[str, List[str]]:
     """
     Uses Chat Completions to get strict JSON:
       { "create_table_sql": "...", "column_list": ["..."] }
     Works for both Azure (deployment name) and public OpenAI.
     """
-    prompt = build_llm_prompt(table, columns)
+    prompt = build_llm_prompt(table, columns, constraints)
 
     resp = client.chat.completions.create(
         model=model_name,
@@ -306,10 +353,11 @@ def llm_generate_snowflake_ddl(client: OpenAI, model_name: str, table: str, colu
 
 
 
-def deterministic_ddl(table: str, columns: List[Tuple]) -> Tuple[str, List[str]]:
+def deterministic_ddl(table: str, columns: List[Tuple], constraints: List[dict]) -> Tuple[str, List[str]]:
     """
     Fallback DDL generator if LLM fails.
     """
+    print("/nUsing fallback deterministic DDL generation logic/n")
     col_defs = []
     col_list = []
     for (name, dtype, length, prec, scale, nullable) in columns:
@@ -318,8 +366,30 @@ def deterministic_ddl(table: str, columns: List[Tuple]) -> Tuple[str, List[str]]
         col_defs.append(f"{sf_ident(name)} {sf_type} {null_sql}".strip())
         col_list.append(name)
 
+    constraint_defs = []
+    # Group columns by constraint name for multi-column constraints
+    pk_cols = []
+    unique_constraints = {}
+    check_constraints = []
+
+    for c in constraints:
+        if c["type"] == "P":
+            pk_cols.append(c["column"])
+        elif c["type"] == "U":
+            unique_constraints.setdefault(c["name"], []).append(c["column"])
+        elif c["type"] == "C" and c["condition"]:
+            check_constraints.append((c["name"], c["condition"]))
+
+    if pk_cols:
+        constraint_defs.append(f"PRIMARY KEY ({', '.join(sf_ident(col) for col in pk_cols)})")
+    for name, cols in unique_constraints.items():
+        constraint_defs.append(f"UNIQUE ({', '.join(sf_ident(col) for col in cols)})")
+    # for name, cond in check_constraints:
+    #     constraint_defs.append(f"CHECK ({cond})") # Snowflake supports CHECK but translating Oracle conditions to Snowflake syntax can be complex; skipping for now.
+
+    all_defs = col_defs + constraint_defs
     ddl_prefix = "CREATE OR REPLACE TABLE" if CREATE_OR_REPLACE else "CREATE TABLE"
-    ddl = f"{ddl_prefix} {sf_ident(table)} (\n  " + ",\n  ".join(col_defs) + "\n);"
+    ddl = f"{ddl_prefix} {sf_ident(table)} (\n  " + ",\n  ".join(all_defs) + "\n);"
     return ddl, col_list
 
 
@@ -390,18 +460,28 @@ def main():
     tables = oracle_tables(src_cur)
     print(f"Found {len(tables)} tables in Oracle source")
 
-    for table in tables:
+    for idx, tbl in enumerate(tables, 1):
+        print(f"{idx}. {tbl}")
+
+    selected = input("Enter the table name(s) to migrate (comma-separated, or just one): ").strip()
+    selected_tables = [t.strip().upper() for t in selected.split(",") if t.strip()]
+
+    for table in selected_tables:
+        if table not in tables:
+            print(f"Skipping table: {table}, not found in selection list")
+            continue
         print(f"\nMigrating table: {table}")
 
         cols = oracle_columns_metadata(src_cur, table)
+        constraints = oracle_table_constraints(src_cur, table)
 
         try:
             # ddl, column_list = llm_generate_snowflake_ddl(llm, table, cols)
-            ddl, column_list = llm_generate_snowflake_ddl(llm, MODEL_NAME, table, cols)
+            ddl, column_list = llm_generate_snowflake_ddl(llm, MODEL_NAME, table, cols, constraints)
             print("LLM generated DDL")
         except Exception as e:
             print(f"LLM failed for {table}, using deterministic fallback. Reason: {e}")
-            ddl, column_list = deterministic_ddl(table, cols)
+            ddl, column_list = deterministic_ddl(table, cols, constraints)
 
         try:
             sf_exec(sf_cur, ddl)
@@ -426,7 +506,7 @@ def main():
             sf_exec(sf_cur, f"SELECT COUNT(*) FROM {sf_ident(table)}")
             tgt_count = int(sf_cur.fetchone()[0])
 
-            #status = "✅" if src_count == tgt_count else "⚠️"
+            
             print(f"Rowcount check {table}: Oracle={src_count}, Snowflake={tgt_count}")
         except Exception as e:
             print(f" Validation skipped/failed for {table}: {e}")

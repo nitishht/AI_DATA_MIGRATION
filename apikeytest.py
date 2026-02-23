@@ -7,9 +7,6 @@
 # # incubator_endpoint = os.getenv("EYQ_INCUBATOR_ENDPOINT")
 # # incubator_key = os.getenv("EYQ_INCUBATOR_KEY")
 
-# # Less secure way
-# incubator_endpoint = "https://eyq-incubator.america.fabric.ey.com/eyq/us/api"
-# incubator_key = "tbYVUCGUBA9YbHVoYHTOIKhgufmPf2LX"
 
 # model = "gpt-5"  # Replace with desired model
 
@@ -58,6 +55,7 @@
 import os, requests
 from dotenv import load_dotenv
 load_dotenv()
+
 
 params = {"api-version": "2024-10-21"}  # or keep "2025-04-16" if your APIM requires it
 api_key = os.getenv("AZURE_OPENAI_API_KEY")
